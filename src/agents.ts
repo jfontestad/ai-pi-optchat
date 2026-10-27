@@ -11,7 +11,7 @@ import { memoryTools, searchTool } from './tools.ts';
 import { VIEW, type Memory } from './memory.ts';
 import type { ModelChoice } from './compactor.ts';
 import { cachePayload } from './cache.ts';
-import { CUT_OFF, RunHistory, isRunning, transition, sessionMessages, savedSession, undelivered, type RunInfo, type RunState, type FinishReason } from './runs.ts';
+import { CUT_OFF, RunHistory, isRunning, transition, sessionMessages, savedSession, undelivered, sentText, type Guidance, type RunInfo, type RunState, type FinishReason } from './runs.ts';
 import { UsageLedger } from './usage.ts';
 import { fullChat, refreshFraction, textContent } from './transcript.ts';
 import { Type, type Static } from 'typebox';
@@ -23,9 +23,13 @@ import { THINKING } from './profiles.ts';
 export interface LiveRun {
   session: AgentSession; info: RunInfo; updated: number; streaming?: AgentMessage;
   tools: Map<string, { name: string; args: unknown; output?: unknown; started: number }>;
-  pendingReports: string[]; pendingGuidance: string[]; wake?: () => void; completion?: Promise<void>; primed?: Promise<unknown>;
+  pendingReports: string[]; pendingGuidance: Guidance[]; wake?: () => void; completion?: Promise<void>; primed?: Promise<unknown>;
   /** Set by the user's interrupt: the queued guidance the run continues with once its current step is aborted; with none, it pauses. */
-  interruption?: RunInfo['guidance'];
+  interruption?: Guidance[];
+  /** Guidance just handed to session.prompt(): the next user message is it, as Pi may rewrite the text (a /skill: line becomes the skill). */
+  prompting?: Guidance;
+  /** Every steer into Pi's queue, one at a time, so each knows which queued text is its own (see `steer`). */
+  steering: Promise<unknown>;
   /** Messages being steered back into Pi's queue after it was cleared; other queue changes wait for it. */
   requeueing?: Promise<void>;
   /** Shared by the children of one spawn whose reports are delivered together, in spawn order. */
@@ -210,8 +214,9 @@ export class Children {
       if (event.type === 'turn_end' || event.type === 'agent_settled') this.options.usage?.backfill(live.session.sessionManager.getEntries(), live.info.parentSession, 'subagent', live.info.id);
       if (event.type === 'message_start' && event.message.role === 'user') {
         const text = textContent(event.message.content);
-        const guidance = live.info.guidance.find(g => g.state === 'queued' && g.text === text);
-        if (guidance) { guidance.state = 'delivered'; this.save(live.info); }
+        const guidance = live.prompting ?? live.info.guidance.find(g => g.state === 'queued' && sentText(g) === text);
+        live.prompting = undefined;
+        if (guidance) { if (text !== guidance.text) guidance.sent = text; guidance.state = 'delivered'; this.save(live.info); }
       }
       if (event.type === 'tool_execution_start') live.tools.set(event.toolCallId, { name: event.toolName, args: event.args, started: Date.now() });
       if (event.type === 'tool_execution_update') {
@@ -288,7 +293,7 @@ export class Children {
           sessionManager: SessionManager.create(directory, join(this.profileDirectory, 'runs')) });
         const info: RunInfo = { id, task: task.task, cwd: directory, model: `${task.model.provider}/${task.model.id}`, thinking: session.thinkingLevel,
           parentSession: this.options.parentSession ?? '', parentId, depth, sessionFile: session.sessionFile, started: Date.now(), state: 'running', guidance: [], ...(connected ? { connected: true } : {}) };
-        const live: LiveRun = { session, info, updated: Date.now(), tools: new Map(), pendingReports: [], pendingGuidance: [] };
+        const live: LiveRun = { session, info, updated: Date.now(), tools: new Map(), pendingReports: [], pendingGuidance: [], steering: Promise.resolve() };
         launched.push(live); this.save(info); this.running.set(id, live);
         this.launching--; reserved--;
         session.subscribe(event => this.observe(live, event));
@@ -378,7 +383,7 @@ export class Children {
     if (!parentId) { await this.report(text); return true; }
     const parent = this.running.get(parentId);
     if (!parent || !['running', 'waiting', 'paused'].includes(parent.info.state)) return false;
-    if (parent.info.state === 'running') await parent.session.steer(text);
+    if (parent.info.state === 'running') await this.steer(parent, text);
     else { parent.pendingReports.push(text); parent.wake?.(); } // A paused parent keeps it until the user resumes it.
     this.changed();
     return true;
@@ -407,7 +412,7 @@ export class Children {
           // Read Pi's queue only once a rebuild has landed, and take the interrupt's messages off it so they arrive once.
           // Until this is done, tell() holds new messages in pendingGuidance, where the turn below or a pause picks them up.
           await live.requeueing;
-          const texts = new Set(guidance.map(g => g.text));
+          const texts = new Set(guidance.map(sentText));
           await this.requeue(live, session.clearQueue().steering.filter(text => !texts.has(text)));
           live.interruption = undefined;
           if (!guidance.length) {
@@ -425,7 +430,7 @@ export class Children {
           if (!transition(info, 'running')) continue; // A stop during the cleanup wins.
           for (const g of guidance) g.state = 'delivered';
           this.save(info);
-          await session.prompt(interruptedWith(guidance.map(g => g.text)));
+          await session.prompt(interruptedWith(guidance.map(sentText)));
           continue;
         }
         const paused = info.state === 'paused';
@@ -438,7 +443,9 @@ export class Children {
         if (!paused && last?.role === 'assistant' && (last.stopReason === 'error' || last.stopReason === 'aborted') && !live.pendingReports.length && !this.directChildren(info.id).length) break;
         if (live.pendingGuidance.length) {
           transition(info, 'running'); this.save(info);
-          await session.prompt(live.pendingGuidance.shift()!);
+          live.prompting = live.pendingGuidance.shift()!;
+          // An extension command sends no message at all, so this can't outlive the prompt and claim a later one.
+          try { await session.prompt(live.prompting.text); } finally { live.prompting = undefined; }
           continue;
         }
         if (live.pendingReports.length) {
@@ -474,7 +481,7 @@ export class Children {
           // Pi's queue must be empty before the handoff turn, or it would take a cancelled message as new input. Guidance in it is
           // already marked undelivered; the rest (a child's message) joins the reports the window never read.
           await live.requeueing;
-          const guidance = new Set(info.guidance.map(g => g.text));
+          const guidance = new Set(info.guidance.map(sentText));
           const unread = [...live.pendingReports.splice(0), ...session.clearQueue().steering.filter(text => !guidance.has(text))];
           if (unread.length) info.handoff.unread = unread;
           transition(info, info.handoff.reason === 'complete' ? 'completed' : 'interrupted');
@@ -539,12 +546,14 @@ export class Children {
     if (!live) throw new Error(`No running subagent ${id}.`);
     const text = live.info.connected && source === 'manager' ? `[Main agent guidance]\n${message.trim()}` : message.trim(); if (!message.trim()) throw new Error('Message is empty.');
     if (source === 'user') this.memory.append('user', `Direct guidance to subagent [${id}]: ${text}`);
-    const guidance: RunInfo['guidance'][number] = { text, date: Date.now(), state: 'queued', from: source };
+    const guidance: Guidance = { text, date: Date.now(), state: 'queued', from: source };
     live.info.guidance.push(guidance); this.save(live.info);
     try {
       await live.requeueing; // Keeps the queue in the order messages were sent.
-      if (live.info.state === 'running' && !live.interruption) await live.session.steer(text);
-      else { live.pendingGuidance.push(text); live.wake?.(); } // Waiting, paused or being interrupted: this message starts its next turn.
+      if (live.info.state === 'running' && !live.interruption) {
+        const sent = await this.steer(live, text);
+        if (sent !== undefined && sent !== text) guidance.sent = sent;
+      } else { live.pendingGuidance.push(guidance); live.wake?.(); } // Waiting, paused or being interrupted: this message starts its next turn.
     }
     catch (error) { guidance.state = 'undelivered'; this.save(live.info); throw error; }
     if (guidance.state === 'undelivered') throw new Error(`${id} finished before it read the message. Tell it again to resume it.`);
@@ -562,8 +571,8 @@ export class Children {
     // Nothing yields before the abort starts, so the run cannot finish in between and drop the messages.
     // They leave pendingGuidance and Pi's steering queue here, and execute() sends them in one prompt. Pi's queue must be empty
     // before the abort: after an aborted tool call Pi hands it to a request the abort cancels.
-    const texts = new Set(guidance.map(g => g.text));
-    live.pendingGuidance = live.pendingGuidance.filter(text => !texts.has(text));
+    live.pendingGuidance = live.pendingGuidance.filter(g => !guidance.includes(g));
+    const texts = new Set(guidance.map(sentText));
     // The rest of the queue (a child's tell_parent message) follows the interrupt's prompt, as reports to a paused run do.
     live.pendingReports.push(...live.session.clearQueue().steering.filter(text => !texts.has(text)));
     live.interruption = guidance;
@@ -578,11 +587,11 @@ export class Children {
     if (!live || text === undefined || live.requeueing || live.interruption) return undefined;
     // The queue holds only texts, so of equal ones the last is taken back, record and queue entry alike.
     const guidance = live.info.guidance.findLast(g => g.state === 'queued' && g.text === text)!;
-    const pending = live.pendingGuidance.lastIndexOf(guidance.text);
+    const pending = live.pendingGuidance.indexOf(guidance);
     if (pending >= 0) live.pendingGuidance.splice(pending, 1);
     else {
       const steering = live.session.getSteeringMessages();
-      const at = steering.lastIndexOf(guidance.text);
+      const at = steering.lastIndexOf(sentText(guidance));
       if (at < 0) return undefined; // Already on its way to the agent.
       // Pi cannot drop a single queued message: clear the queue and steer the rest back in order.
       void this.requeue(live, live.session.clearQueue().steering.filter((_, i) => i !== at));
@@ -590,9 +599,16 @@ export class Children {
     live.info.guidance.splice(live.info.guidance.indexOf(guidance), 1); this.save(live.info);
     return guidance.text;
   }
+  /** Pi's steer(), returning what Pi queued, which may differ from `text` (a /skill: line becomes the skill): that is what the agent receives. */
+  private steer(live: LiveRun, text: string) {
+    // One at a time, so the newest entry in Pi's queue is this one's.
+    const sent = live.steering.then(async () => await live.session.steer(text) === 'queued' ? live.session.getSteeringMessages().at(-1) : undefined);
+    live.steering = sent.catch(() => undefined);
+    return sent;
+  }
   private requeue(live: LiveRun, texts: string[]) {
     const work: Promise<void> = (async () => {
-      try { for (const text of texts) await live.session.steer(text); }
+      try { for (const text of texts) await this.steer(live, text); }
       catch (error) { this.warn(`Could not requeue a message for ${live.info.id}: ${String(error)}`); }
     })().finally(() => { if (live.requeueing === work) live.requeueing = undefined; });
     live.requeueing = work;
@@ -634,7 +650,7 @@ export class Children {
       const info: RunInfo = { ...rest, state: 'running', started: Date.now(), parentSession: this.options.parentSession ?? run.parentSession,
         guidance: [...run.guidance, { text: prompt, date: Date.now(), state: 'queued', from: 'manager' }] };
       try { this.save(info); } catch (error) { this.history.records.set(id, run); await this.shutdown(session); this.dispose(session); throw error; }
-      const live: LiveRun = { session, info, updated: Date.now(), tools: new Map(), pendingReports: [], pendingGuidance: [] };
+      const live: LiveRun = { session, info, updated: Date.now(), tools: new Map(), pendingReports: [], pendingGuidance: [], steering: Promise.resolve() };
       this.running.set(id, live);
       this.launching--; reserved = false;
       session.subscribe(event => this.observe(live, event));
